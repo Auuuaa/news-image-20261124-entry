@@ -1,97 +1,94 @@
+// THE WORLD TODAY — news-image-20261124 entry point.
+//
+// The front page is drawn ahead of time by render.py into entry.png.
+// This program only proves the PNG is whole and within the bounty
+// limits (1024x1024, at most 1 MiB, every chunk CRC valid) and then
+// places it where the harness asks via $MAKEFUN_OUTPUT_DIR.
+//
+// The PNG is located next to this script, never relative to the
+// process working directory: the grader may invoke the program from
+// any directory, so the script's own directory is the anchor.
+
+import { crc32 } from "node:zlib";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-// Entry point for the news-image-20261124 bounty. The front page is
-// drawn by render.py into entry.png; this program only checks that the
-// PNG meets the bounty rules (1024x1024, at most 1 MiB, well-formed
-// PNG with valid chunk CRCs) and copies it into the output directory
-// the harness points at with $MAKEFUN_OUTPUT_DIR.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SOURCE_PNG = join(HERE, "entry.png");
+const MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const SIDE = 1024;
+const CAP = 1024 * 1024;
 
-const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const EXPECTED_W = 1024;
-const EXPECTED_H = 1024;
-const MAX_BYTES = 1024 * 1024;
-
-// CRC-32 (IEEE 802.3) table, built once at startup.
-const CRC_TABLE: number[] = [];
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) {
-    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  }
-  CRC_TABLE.push(c >>> 0);
-}
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (const b of buf) {
-    c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function fail(msg: string): never {
-  console.error(`entry check failed: ${msg}`);
+function abort(why: string): never {
+  console.error(`entry check failed: ${why}`);
   process.exit(1);
 }
 
-function checkPng(path: string): void {
-  if (!existsSync(path)) {
-    fail(`missing ${path} — run render.py first`);
+function inspect(png: Buffer): void {
+  if (png.length < 8 || !png.subarray(0, 8).equals(MAGIC)) {
+    abort("not a PNG file (bad signature)");
   }
-  const bytes = readFileSync(path);
-  if (bytes.length > MAX_BYTES) {
-    fail(`entry.png is ${bytes.length} bytes, over the 1 MiB cap`);
+  if (png.length > CAP) {
+    abort(`entry.png is ${png.length} bytes, over the 1 MiB cap`);
   }
-  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIG)) {
-    fail("not a PNG file (bad signature)");
-  }
-  let off = 8;
-  let sawIhdr = false;
-  while (off + 12 <= bytes.length) {
-    const len = bytes.readUInt32BE(off);
-    const type = bytes.subarray(off + 4, off + 8).toString("ascii");
-    const dataEnd = off + 8 + len;
-    if (dataEnd + 4 > bytes.length) {
-      fail(`chunk ${type} runs past the end of the file`);
+  let cursor = 8;
+  let headerSeen = false;
+  let endSeen = false;
+  while (cursor + 12 <= png.length) {
+    const payloadLen = png.readUInt32BE(cursor);
+    const kind = png.toString("ascii", cursor + 4, cursor + 8);
+    const payloadEnd = cursor + 8 + payloadLen;
+    if (payloadEnd + 4 > png.length) {
+      abort(`chunk ${kind} runs past the end of the file`);
     }
-    const stored = bytes.readUInt32BE(dataEnd);
-    const actual = crc32(bytes.subarray(off + 4, dataEnd));
-    if (stored !== actual) {
-      fail(`chunk ${type} has a bad CRC`);
+    const storedCrc = png.readUInt32BE(payloadEnd);
+    const realCrc = crc32(png.subarray(cursor + 4, payloadEnd));
+    if (storedCrc !== realCrc) {
+      abort(`chunk ${kind} has a bad CRC`);
     }
-    if (type === "IHDR") {
-      sawIhdr = true;
-      const w = bytes.readUInt32BE(off + 8);
-      const h = bytes.readUInt32BE(off + 12);
-      const depth = bytes[off + 16];
-      const colour = bytes[off + 17];
-      if (w !== EXPECTED_W || h !== EXPECTED_H) {
-        fail(`image is ${w}x${h}, expected ${EXPECTED_W}x${EXPECTED_H}`);
+    if (kind === "IHDR") {
+      headerSeen = true;
+      const width = png.readUInt32BE(cursor + 8);
+      const height = png.readUInt32BE(cursor + 12);
+      const bitDepth = png[cursor + 16];
+      const colourKind = png[cursor + 17];
+      if (width !== SIDE || height !== SIDE) {
+        abort(`image is ${width}x${height}, expected ${SIDE}x${SIDE}`);
       }
-      if (depth !== 8 || (colour !== 2 && colour !== 6)) {
-        fail(`unexpected PNG colour setup (depth ${depth}, type ${colour})`);
+      if (bitDepth !== 8 || (colourKind !== 2 && colourKind !== 6)) {
+        abort(`unexpected PNG colour setup (depth ${bitDepth}, type ${colourKind})`);
       }
     }
-    off = dataEnd + 4;
-    if (type === "IEND") {
+    cursor = payloadEnd + 4;
+    if (kind === "IEND") {
+      endSeen = true;
       break;
     }
   }
-  if (!sawIhdr) {
-    fail("no IHDR chunk found");
+  if (!headerSeen) {
+    abort("no IHDR chunk found");
+  }
+  if (!endSeen) {
+    abort("no IEND chunk — file is truncated");
   }
 }
 
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "./output";
-checkPng("entry.png");
-mkdirSync(outDir, { recursive: true });
-const dest = join(outDir, "entry.png");
-copyFileSync("entry.png", dest);
-// Confirm the copy landed whole before reporting success.
-const srcSize = statSync("entry.png").size;
-const dstSize = statSync(dest).size;
-if (dstSize !== srcSize) {
-  fail(`copied entry.png is ${dstSize} bytes, expected ${srcSize}`);
+if (!existsSync(SOURCE_PNG)) {
+  abort(`missing ${SOURCE_PNG} — run render.py first`);
 }
-console.log(`entry.png OK: 1024x1024, ${srcSize} bytes -> ${dest}`);
+if (!statSync(SOURCE_PNG).isFile()) {
+  abort(`${SOURCE_PNG} is not a regular file`);
+}
+const image = readFileSync(SOURCE_PNG);
+inspect(image);
+
+const targetDir = process.env.MAKEFUN_OUTPUT_DIR ?? join(HERE, "output");
+mkdirSync(targetDir, { recursive: true });
+const target = join(targetDir, "entry.png");
+copyFileSync(SOURCE_PNG, target);
+const copied = readFileSync(target);
+if (!copied.equals(image)) {
+  abort("copied entry.png differs from the source");
+}
+console.log(`entry.png OK: 1024x1024, ${image.length} bytes -> ${target}`);
